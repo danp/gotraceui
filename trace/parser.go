@@ -293,15 +293,25 @@ type proc struct {
 	done bool
 }
 
-// parseRest reads per-P event batches and merges them into a single, consistent stream.
-// The high level idea is as follows. Events within an individual batch are in
-// correct order, because they are emitted by a single P. So we need to produce
-// a correct interleaving of the batches. To do this we take first unmerged event
-// from each batch (frontier). Then choose subset that is "ready" to be merged,
-// that is, events for which all dependencies are already merged. Then we choose
-// event with the lowest timestamp from the subset, merge it and repeat.
-// This approach ensures that we form a consistent stream even if timestamps are
-// incorrect (condition observed on some machines).
+type eventList []Event
+
+func (l *eventList) Len() int {
+	return len(*l)
+}
+
+func (l *eventList) Less(i, j int) bool {
+	return (*l)[i].Ts < (*l)[j].Ts
+}
+
+func (l *eventList) Swap(i, j int) {
+	(*l)[i], (*l)[j] = (*l)[j], (*l)[i]
+}
+
+// parseRest reads per-P event batches and merges them into a single stream, sorted by time.
+//
+// Unlike the code in go tool trace, we do not use Dmitry Vyukov's fancy algorithm for merging events in a consistent
+// manner. His code is meant to handle traces with inconsistent timestamps (maybe due to unsynchronized TSCs?), but it
+// never actually worked for such traces (see https://go.dev/issues/16755).
 func (p *Parser) parseRest() ([]Event, error) {
 	// The ordering of CPU profile sample events in the data stream is based on
 	// when each run of the signal handler was able to acquire the spinlock,
@@ -328,15 +338,6 @@ func (p *Parser) parseRest() ([]Event, error) {
 
 	events := make([]Event, 0, totalEvents)
 
-	// Merge events as long as at least one P has more events
-	gs := make(map[uint64]gState)
-	// Note: technically we don't need a priority queue here. We're only ever interested in the earliest elligible
-	// event, which means we just have to track the smallest element. However, in practice, the priority queue performs
-	// better, because for each event we only have to compute its state transition once, not on each iteration. If it
-	// was elligible before, it'll already be in the queue. Furthermore, on average, we only have one P to look at in
-	// each iteration, because all other Ps are already in the queue.
-	var frontier orderEventList
-
 	availableProcs := make([]*proc, len(allProcs))
 	for i := range allProcs {
 		availableProcs[i] = &allProcs[i]
@@ -345,6 +346,9 @@ func (p *Parser) parseRest() ([]Event, error) {
 		if p.progress != nil && len(events)%100_000 == 0 {
 			p.progress(0.5 + 0.5*(float64(len(events))/float64(cap(events))))
 		}
+		var set bool
+		var earliest Event
+		var procID int
 	pidLoop:
 		for i := 0; i < len(availableProcs); i++ {
 			proc := availableProcs[i]
@@ -367,28 +371,15 @@ func (p *Parser) parseRest() ([]Event, error) {
 				}
 			}
 
-			ev := &proc.events[0]
-			g, init, _ := stateTransition(ev)
-
-			// TODO(dh): This implementation matches the behavior of the upstream 'go tool trace', and works in
-			// practice, but has run into the following inconsistency during fuzzing: what happens if multiple Ps have
-			// events for the same G? While building the frontier we will check all of the events against the current
-			// state of the G. However, when we process the frontier, the state of the G changes, and a transition that
-			// was valid while building the frontier may no longer be valid when processing the frontier. Is this
-			// something that can happen for real, valid traces, or is this only possible with corrupt data?
-			if !transitionReady(g, gs[g], init) {
-				continue
+			ev := proc.events[0]
+			if !set || ev.Ts < earliest.Ts {
+				set = true
+				earliest = ev
+				procID = i
 			}
-			proc.events = proc.events[1:]
-			availableProcs[i], availableProcs[len(availableProcs)-1] = availableProcs[len(availableProcs)-1], availableProcs[i]
-			availableProcs = availableProcs[:len(availableProcs)-1]
-			frontier.Push(orderEvent{*ev, proc})
-
-			// We swapped the element at i with another proc, so look at the index again
-			i--
 		}
 
-		if len(frontier) == 0 {
+		if !set {
 			for i := range allProcs {
 				if !allProcs[i].done {
 					return nil, fmt.Errorf("no consistent ordering of events possible")
@@ -396,67 +387,20 @@ func (p *Parser) parseRest() ([]Event, error) {
 			}
 			break
 		}
-		f := frontier.Pop()
-
-		// We're computing the state transition twice, once when computing the frontier, and now to apply the
-		// transition. This is fine because stateTransition is a pure function. Computing it again is cheaper than
-		// storing large items in the frontier.
-		g, init, next := stateTransition(&f.ev)
 
 		// Get rid of "Local" events, they are intended merely for ordering.
-		switch f.ev.Type {
+		switch earliest.Type {
 		case EvGoStartLocal:
-			f.ev.Type = EvGoStart
+			earliest.Type = EvGoStart
 		case EvGoUnblockLocal:
-			f.ev.Type = EvGoUnblock
+			earliest.Type = EvGoUnblock
 		case EvGoSysExitLocal:
-			f.ev.Type = EvGoSysExit
+			earliest.Type = EvGoSysExit
 		}
-		events = append(events, f.ev)
-
-		if err := transition(gs, g, init, next); err != nil {
-			return nil, err
-		}
-		availableProcs = append(availableProcs, f.proc)
+		events = append(events, earliest)
+		availableProcs[procID].events = availableProcs[procID].events[1:]
+		continue
 	}
-
-	// At this point we have a consistent stream of events.
-	// Make sure time stamps respect the ordering.
-	// The tests will skip (not fail) the test case if they see this error.
-	if !sort.IsSorted((*eventList)(&events)) {
-		return nil, ErrTimeOrder
-	}
-
-	// The last part is giving correct timestamps to EvGoSysExit events.
-	// The problem with EvGoSysExit is that actual syscall exit timestamp (ev.Args[2])
-	// is potentially acquired long before event emission. So far we've used
-	// timestamp of event emission (ev.Ts).
-	// We could not set ev.Ts = ev.Args[2] earlier, because it would produce
-	// seemingly broken timestamps (misplaced event).
-	// We also can't simply update the timestamp and resort events, because
-	// if timestamps are broken we will misplace the event and later report
-	// logically broken trace (instead of reporting broken timestamps).
-	lastSysBlock := make(map[uint64]Timestamp)
-	for _, ev := range events {
-		switch ev.Type {
-		case EvGoSysBlock, EvGoInSyscall:
-			lastSysBlock[ev.G] = ev.Ts
-		case EvGoSysExit:
-			ts := Timestamp(ev.Args[2])
-			if ts == 0 {
-				continue
-			}
-			block := lastSysBlock[ev.G]
-			if block == 0 {
-				return nil, fmt.Errorf("stray syscall exit")
-			}
-			if ts < block {
-				return nil, ErrTimeOrder
-			}
-			ev.Ts = ts
-		}
-	}
-	sort.Stable((*eventList)(&events))
 
 	return events, nil
 }
@@ -937,7 +881,16 @@ func (p *Parser) parseEvent(raw *rawEvent, ev *Event) error {
 			EvGoBlockSelect, EvGoBlockSync, EvGoBlockCond, EvGoBlockNet,
 			EvGoSysBlock, EvGoBlockGC:
 			p.lastG = 0
-		case EvGoSysExit, EvGoWaiting, EvGoInSyscall:
+		case EvGoSysExit:
+			ev.G = ev.Args[0]
+			// The problem with EvGoSysExit is that actual syscall exit timestamp (ev.Args[2])
+			// is potentially acquired long before event emission. So far we've used
+			// timestamp of event emission (ev.Ts).
+			ts := Timestamp(ev.Args[2])
+			if ts != 0 {
+				ev.Ts = ts
+			}
+		case EvGoWaiting, EvGoInSyscall:
 			ev.G = ev.Args[0]
 		case EvUserTaskCreate:
 			// e.Args 0: taskID, 1:parentID, 2:nameID
